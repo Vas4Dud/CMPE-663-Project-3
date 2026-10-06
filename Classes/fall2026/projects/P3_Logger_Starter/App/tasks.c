@@ -191,6 +191,8 @@ void app_start(void)
                                      .priority = osPriorityLow };
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u,
                                      .priority = osPriorityLow };
+    const osThreadAttr_t im_attr = { .name = "im", .stack_size = 512u,
+                                    .priority = osPriorityAboveNormal };
     osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadNew(UITask,        NULL, &ui_attr);
 }
@@ -262,37 +264,36 @@ static void ImuSampleTask(void *arg)
         smooth_acc.z = 0;
         
         static uint8_t smooth_count = 0;
-        if (imu_int1_event == 1)
+        osSemaphoreAcquire(imuDrdySemHandle, osWaitForever);
+        osMutexAcquire(i2c3MutexHandle, osWaitForever);
+        ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
+        osMutexRelease(i2c3MutexHandle);
+        if (check == 0)
         {
-            imu_int1_event = 0;
-            uint32_t check = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
-            if (check == 0)
+            if (smooth_count < 4)
             {
-                if (smooth_count < 4)
+                four_acc[smooth_count] = current_acc;
+                smooth_count++;
+                acc_data_ready = false;
+            }
+            else 
+            {
+                for (int i = 0; i < 4; i++)
                 {
-                    four_acc[smooth_count] = current_acc;
-                    smooth_count++;
-                    acc_data_ready = false;
+                    smooth_acc.x += four_acc[i].x;
+                    smooth_acc.y += four_acc[i].y;
+                    smooth_acc.z += four_acc[i].z;
                 }
-                else 
-                {
-                    for (int i = 0; i < 4; i++)
-                    {
-                        smooth_acc.x += four_acc[i].x;
-                        smooth_acc.y += four_acc[i].y;
-                        smooth_acc.z += four_acc[i].z;
-                    }
-                    smooth_acc.x /= 4;
-                    smooth_acc.y /= 4;
-                    smooth_acc.z /= 4;
-                    float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
-                    pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
-                    roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
-                    angle = lroundf(pitch * 10) - angle_offset;
-                    roll_calib = lroundf(roll * 10) - roll_offset;
-                    smooth_count = 0;
-                    acc_data_ready = true;
-                }
+                smooth_acc.x /= 4;
+                smooth_acc.y /= 4;
+                smooth_acc.z /= 4;
+                float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
+                pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
+                roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
+                angle = lroundf(pitch * 10) - angle_offset;
+                roll_calib = lroundf(roll * 10) - roll_offset;
+                smooth_count = 0;
+                acc_data_ready = true;
             }
         }
         else 
@@ -305,7 +306,12 @@ static void ImuSampleTask(void *arg)
 
 static void VitalsSampleTask(void *arg)
 {
-
+    uint32_t tick = osKernelGetTickCount();
+    uint32_t sub  = 0u;
+    for (;;) {
+        tick += 50u;
+        osDelayUntil(tick);
+    }
 }
 
 static void LoggerTask(void *arg)
@@ -313,7 +319,7 @@ static void LoggerTask(void *arg)
 
 }
 
-static void UITask(void *arg)
+/*static void UITask(void *arg)
 {
     (void)arg;
     uint32_t tick = osKernelGetTickCount();
@@ -322,13 +328,13 @@ static void UITask(void *arg)
         tick += 50u;
         osDelayUntil(tick);
 
-        cmd_table_poll();                    /* non-blocking console service   */
+        cmd_table_poll();                    
 
-        if (++sub >= 20u) {                  /* ~1 s                           */
+        if (++sub >= 20u) {                 
             sub = 0u;
             perf_mon_tick_1s();
 
-            float tc = 0.0f;                 /* live temp under the bus mutex  */
+            float tc = 0.0f;                
             osMutexAcquire(i2c3MutexHandle, osWaitForever);
             (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
             osMutexRelease(i2c3MutexHandle);
@@ -337,14 +343,12 @@ static void UITask(void *arg)
             ui_live_t live = {
                 .temp_dC     = (int16_t)td,
                 .temp_fault  = 0u,
-                .posture     = UI_POSTURE_UNKNOWN,   /* your IMU sampler fills */
-                .range_mm    = 0u,                   /* your ToF read fills    */
+                .posture     = UI_POSTURE_UNKNOWN,   
+                .range_mm    = 0u,                  
                 .range_fault = 0u,
                 .cpu_percent = (uint8_t)perf_cpu_percent(),
             };
-            ui_pages_render(&live);          /* LIVE page (B1 cycling: connect
-                                              * ui_pages_next() to the button
-                                              * in your full design)           */
+            ui_pages_render(&live);          
 
             printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu  temp=%d.%dC\n",
                    perf_cpu_percent(), (unsigned long)perf_idle_per_sec(),
@@ -352,4 +356,4 @@ static void UITask(void *arg)
                    td / 10, (td < 0 ? -td : td) % 10);
         }
     }
-}
+}*/
