@@ -146,6 +146,31 @@ int32_t log_append(const log_record_t *rec)
      *  5. s_count++.
      * Hold the mutex ONLY around the PageProgram call (about 750 us maximum).
      * Do not hold it across the full function (spec R6/R9). */
+    
+    if (s_full)
+    {
+        s_overflow++;
+        return LOG_FUL;
+    }
+
+    //HOW DO I DO THE COPY INTO S_PAGE
+    s_page[i] =  
+
+    s_page_fill = 16;
+    if (s_page_fill == 256)
+    {
+        flash_lock();
+        S25FL128S_PageProgram(DATA_BASE + s_write_off, s_page, 256);
+        flash_unlock();
+        s_write_off += 256;
+        s_page_fill = 0;
+    }
+    if (s_write_off >= DATA_SIZE)
+    {
+        s_full = 1;
+    }
+    s_count++;
+
     return LOG_OK;
 }
 
@@ -162,6 +187,18 @@ int32_t log_read_record(uint32_t index, log_record_t *out)
      * Remember that DOWNLOAD reads in CHUNKS and releases the mutex between
      * them (spec R9). That release is what lets the logging continue during
      * a download. */
+
+     if (index < s_count)
+     {
+        flash_lock();
+        S25FL128S_Read(DATA_BASE + index*16, out, 16);
+        flash_unlock();
+
+        if (out->crc16 != log_crc16(out, 14))
+        {
+            return LOG_F_FAULT;
+        }
+     }
     return LOG_ERR;
 }
 
