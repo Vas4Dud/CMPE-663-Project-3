@@ -17,7 +17,9 @@
  *  exercises the provided command-table parser.
  ******************************************************************************
  */
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include "main.h"
 #include "tasks.h"
@@ -32,6 +34,10 @@
 #include "s25fl128s.h"
 
 extern QSPI_HandleTypeDef hqspi;      /* CubeMX-generated once QUADSPI is on   */
+
+static void ImuSampleTask(void *arg);
+static void VitalsSampleTask(void *arg);
+
 
 /* ---- shared RTOS handles (declared extern in tasks.h / log_store.c) --------*/
 osMutexId_t        flashMutexHandle;
@@ -191,10 +197,14 @@ void app_start(void)
                                      .priority = osPriorityLow };
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u,
                                      .priority = osPriorityLow };
-    const osThreadAttr_t im_attr = { .name = "im", .stack_size = 512u,
+    const osThreadAttr_t im_attr = { .name = "im", .stack_size = 2048u,
                                     .priority = osPriorityAboveNormal };
+    const osThreadAttr_t vi_attr = { .name = "vi", .stack_size = 2048u,
+                                    .priority = osPriorityNormal };                                
     osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadNew(UITask,        NULL, &ui_attr);
+    osThreadNew(ImuSampleTask,        NULL, &im_attr);
+    osThreadNew(VitalsSampleTask, NULL, &vi_attr);
 }
 
 /* ==================== ISR -> task handoff (spec R4/R10) =================== */
@@ -259,46 +269,49 @@ static void ImuSampleTask(void *arg)
         ISM330DHCX_Axes_t current_acc;
         static ISM330DHCX_Axes_t four_acc[4];
         static ISM330DHCX_Axes_t smooth_acc;
+        static float pitch;
+        static float roll;
+        static uint32_t angle;
+        static uint32_t roll_calib;
+
         smooth_acc.x = 0;
         smooth_acc.y = 0;
         smooth_acc.z = 0;
         
         static uint8_t smooth_count = 0;
-        osSemaphoreAcquire(imuDrdySemHandle, osWaitForever);
+        osSemaphoreAcquire(imuDrdySemHandle, 100);
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
         ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
         osMutexRelease(i2c3MutexHandle);
-        if (check == 0)
+
+        if (smooth_count < 4)
         {
-            if (smooth_count < 4)
-            {
-                four_acc[smooth_count] = current_acc;
-                smooth_count++;
-                acc_data_ready = false;
-            }
-            else 
-            {
-                for (int i = 0; i < 4; i++)
-                {
-                    smooth_acc.x += four_acc[i].x;
-                    smooth_acc.y += four_acc[i].y;
-                    smooth_acc.z += four_acc[i].z;
-                }
-                smooth_acc.x /= 4;
-                smooth_acc.y /= 4;
-                smooth_acc.z /= 4;
-                float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
-                pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
-                roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
-                angle = lroundf(pitch * 10) - angle_offset;
-                roll_calib = lroundf(roll * 10) - roll_offset;
-                smooth_count = 0;
-                acc_data_ready = true;
-            }
+            four_acc[smooth_count] = current_acc;
+            smooth_count++;
+            acc_data_ready = false;
         }
         else 
         {
-            acc_data_ready = false;
+            for (int i = 0; i < 4; i++)
+            {
+                smooth_acc.x += four_acc[i].x;
+                smooth_acc.y += four_acc[i].y;
+                smooth_acc.z += four_acc[i].z;
+            }
+            smooth_acc.x /= 4;
+            smooth_acc.y /= 4;
+            smooth_acc.z /= 4;
+            float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
+            pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
+            roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
+            angle = lroundf(pitch * 10); //- angle_offset;  //FIX THIS
+            roll_calib = lroundf(roll * 10); //- roll_offset;
+            smooth_count = 0;
+            acc_data_ready = true;
+        }
+        if (acc_data_ready)
+        {
+            //printf("works %d.%d", (angle / 10), (angle % 10));
         }
     }
     
@@ -309,8 +322,19 @@ static void VitalsSampleTask(void *arg)
     uint32_t tick = osKernelGetTickCount();
     uint32_t sub  = 0u;
     for (;;) {
-        tick += 50u;
+        tick += 1000u;
         osDelayUntil(tick);
+        sub = 0u;
+
+        float tc = 0.0f;                 /* live temp under the bus mutex  */
+        uint16_t mm = 0;
+        osMutexAcquire(i2c3MutexHandle, osWaitForever);
+        (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
+        (void)VL53L0X_ReadRangeSingle(&tof, &mm);
+        osMutexRelease(i2c3MutexHandle);
+        int td = (int)(tc * 10.0f);
+        int check = (int) mm;
+        printf("works %d.%d,   mm %d\n", (td / 10), (td % 10), check);
     }
 }
 
