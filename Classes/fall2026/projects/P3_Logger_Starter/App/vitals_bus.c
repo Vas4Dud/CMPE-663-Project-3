@@ -86,7 +86,8 @@ int32_t vitals_bus_init(void)
     if (ISM330DHCX_Init(&imu) != ISM330DHCX_OK ||
         ISM330DHCX_ACC_SetFullScale(&imu, 2) != ISM330DHCX_OK ||
         ISM330DHCX_ACC_SetOutputDataRate(&imu, 104.0f) != ISM330DHCX_OK ||
-        ISM330DHCX_ACC_Enable(&imu) != ISM330DHCX_OK) {
+        ISM330DHCX_ACC_Enable(&imu) != ISM330DHCX_OK ||
+        ISM330DHCX_ACC_Enable_DRDY_On_INT1(&imu) != ISM330DHCX_OK){
         printf("POST: ISM330DHCX  config FAILED\n");
         return -2;
     }
