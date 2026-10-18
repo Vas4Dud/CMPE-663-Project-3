@@ -15,7 +15,9 @@
 #include "s25fl128s.h"
 #include "cmsis_os2.h"          /* osMutexAcquire/Release (available after the
                                  * FreeRTOS regen — see README)                */
+#include <stdint.h>
 #include <string.h>
+#include <sys/types.h>
 
 /* ---- Flash layout (demo-scaled small so LOG FULL is reachable — R21/§7.3) -*/
 #define HEADER_ADDR      0x000000u              /* one 4-KB parameter sector   */
@@ -68,6 +70,8 @@ static uint8_t  s_full;
 static uint32_t s_overflow;
 static uint8_t  s_page[S25FL128S_PAGE_SIZE];    /* RAM staging page (256 B)    */
 static uint32_t s_page_fill;                    /* bytes buffered in s_page    */
+static uint16_t s_session_num;
+static uint32_t s_header_index;
 
 static inline void flash_lock(void)   { osMutexAcquire(flashMutexHandle, osWaitForever); }
 static inline void flash_unlock(void) { osMutexRelease(flashMutexHandle); }
@@ -99,6 +103,28 @@ int32_t log_store_init(void)
     s_full      = 0u;
     s_overflow  = 0u;
     s_page_fill = 0u;
+    s_session_num = 0;
+    s_header_index = 0;
+    log_header_t out;
+    uint32_t i;
+    for (i = 0; i < HDR_SLOT_COUNT; i++)
+    {
+        S25FL128S_Read(HDR_SLOT_ADDR(i), (uint8_t *) &out, sizeof(out));
+        if (out.magic != LOG_HDR_MAGIC)
+        {
+            break;
+        }
+        if (log_crc16((const uint8_t *)&out, 30) != out.crc16)
+        {
+            break;
+        }
+        s_write_off = out.write_off;
+        s_count = out.record_count;
+        s_full = out.log_full;
+        s_session_num = out.session_id;
+        s_header_index = i + 1;
+    }
+
     return LOG_OK;
 }
 
@@ -121,18 +147,35 @@ int32_t log_format(void)
     if (rc == LOG_OK) {
         s_write_off = 0u; s_count = 0u; s_full = 0u;
         s_overflow  = 0u; s_page_fill = 0u;
+        s_session_num++; s_header_index = 0;
     }
     /* STUDENT TODO: page-program a new log_header_t into slot 0 (the `magic`
      * value, a new session_id, zero counts, and crc16). That is the first
      * turn of the rotating slot (R20). Each header refresh after that takes
      * the NEXT free slot. */
+    log_header_t out = {0};
+    out.magic = LOG_HDR_MAGIC;
+    out.session_id = s_session_num;
+    out.write_off = s_write_off;
+    out.record_count = s_count;
+    out.log_full = s_full;
+    out.crc16 = log_crc16((const uint8_t *)&out, 30);
+    
+    if (rc == LOG_OK)
+    {
+        flash_lock();
+        S25FL128S_PageProgram(HDR_SLOT_ADDR(s_header_index), (const uint8_t *) &out, sizeof(out));
+        flash_unlock();
+        s_header_index++;
+    }
+
     return rc;
 }
 
 /* ---- append: STUDENT TODO (the heart of the logger, spec R18/R21) ---------*/
 int32_t log_append(const log_record_t *rec)
 {
-    (void)rec; (void)s_page; (void)s_page_fill;
+    //(void)rec; (void)s_page; (void)s_page_fill;
     /* STUDENT TODO:
      *  1. If s_full, s_overflow++ and return LOG_FULL (do NOT overwrite — R21).
      *  2. Write rec->crc16 with log_crc16 over the first 14 bytes FIRST, then
@@ -150,13 +193,14 @@ int32_t log_append(const log_record_t *rec)
     if (s_full)
     {
         s_overflow++;
-        return LOG_FUL;
+        return LOG_FULL;
     }
 
-    //HOW DO I DO THE COPY INTO S_PAGE
-    s_page[i] =  
-
-    s_page_fill = 16;
+    log_record_t temp = *rec;
+    temp.crc16 = log_crc16((const uint8_t *) &temp, 14);
+    memcpy(&s_page[s_page_fill], &temp, sizeof(temp));
+    s_page_fill += 16;
+    s_count++;
     if (s_page_fill == 256)
     {
         flash_lock();
@@ -164,12 +208,26 @@ int32_t log_append(const log_record_t *rec)
         flash_unlock();
         s_write_off += 256;
         s_page_fill = 0;
+
+        if (s_write_off >= DATA_SIZE)
+        {
+            s_full = 1;
+        }
+
+        if (s_full)
+        {
+            log_header_t out;
+            out.crc16 = log_crc16(0, 0);
+            out.magic = LOG_HDR_MAGIC;
+            out.session_id = 0;
+            out.record_count = 0;
+            out.write_off = 0;
+            flash_lock();
+            S25FL128S_PageProgram(HDR_SLOT_ADDR(s_header_index), (const uint8_t *) &out, sizeof(out));
+            flash_unlock();
+            s_header_index++;
+        }
     }
-    if (s_write_off >= DATA_SIZE)
-    {
-        s_full = 1;
-    }
-    s_count++;
 
     return LOG_OK;
 }
@@ -177,7 +235,7 @@ int32_t log_append(const log_record_t *rec)
 /* ---- read-back for DOWNLOAD: STUDENT TODO --------------------------------*/
 int32_t log_read_record(uint32_t index, log_record_t *out)
 {
-    (void)index; (void)out;
+    //(void)index; (void)out;
     /* STUDENT TODO:
      *  1. Bounds-check that index is less than s_count.
      *  2. flash_lock(), then S25FL128S_Read(DATA_BASE + index*16, out, 16),
@@ -187,17 +245,16 @@ int32_t log_read_record(uint32_t index, log_record_t *out)
      * Remember that DOWNLOAD reads in CHUNKS and releases the mutex between
      * them (spec R9). That release is what lets the logging continue during
      * a download. */
-
      if (index < s_count)
      {
         flash_lock();
-        S25FL128S_Read(DATA_BASE + index*16, out, 16);
+        S25FL128S_Read(DATA_BASE + index*16, (uint8_t *) out, 16);
         flash_unlock();
-
-        if (out->crc16 != log_crc16(out, 14))
+        if (out->crc16 != log_crc16((const uint8_t *) out, 14))
         {
-            return LOG_F_FAULT;
+            out->flags |= LOG_F_FAULT;
         }
+        return LOG_OK;
      }
     return LOG_ERR;
 }
