@@ -26,7 +26,10 @@ extern osMutexId_t       i2c3MutexHandle;    /* SECONDARY: the sensor bus (R7) *
 extern osMessageQueueId_t vitalsQueueHandle; /* samplers -> logger (R8)        */
 extern osSemaphoreId_t   imuDrdySemHandle;   /* IMU DRDY ISR -> task (R4)      */
 
+
 void app_post(void);
 void app_start(void);
+static void create_record(uint32_t timestamp_ms, uint8_t  channel, uint8_t  flags, uint8_t  payload[8]);
+static uint8_t posture_check(int32_t roll);
 
 #endif /* TASKS_H */
