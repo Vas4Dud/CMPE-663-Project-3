@@ -21,11 +21,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "cmsis_os2.h"
 #include "main.h"
 #include "tasks.h"
 #include "oled.h"
 #include "console.h"
 #include "rgb_led.h"
+#include "stm32wbxx_hal.h"
+#include "stm32wbxx_hal_pwr_ex.h"
 #include "vitals_bus.h"
 #include "perf_mon.h"
 #include "log_store.h"
@@ -37,7 +42,10 @@ extern QSPI_HandleTypeDef hqspi;      /* CubeMX-generated once QUADSPI is on   *
 
 static void ImuSampleTask(void *arg);
 static void VitalsSampleTask(void *arg);
-
+static void LoggerTask(void *arg);
+static void UITask(void *arg);
+static void create_record(uint32_t timestamp_ms, uint8_t  channel, uint8_t  flags, uint8_t  payload[8]);
+static uint8_t posture_check(int32_t roll);
 
 /* ---- shared RTOS handles (declared extern in tasks.h / log_store.c) --------*/
 osMutexId_t        flashMutexHandle;
@@ -46,7 +54,9 @@ osMessageQueueId_t vitalsQueueHandle;
 osSemaphoreId_t    imuDrdySemHandle;
 
 bool acc_data_ready = false;
-
+static int16_t td = 0;
+static uint8_t pos = UI_POSTURE_UNKNOWN;
+static uint16_t total_records = 0;
 /* ============================ POST (pre-scheduler) ======================== */
 
 void app_post(void)
@@ -99,8 +109,33 @@ static void cmd_help(int argc, char *argv[])
     cmd_table_help();
 }
 
+static void download()
+{
+    log_status_t status;
+    log_store_status(&status);
+    log_record_t out;
+    for (int i = 0; i < status.record_count; i++)
+    {
+        log_read_record(i, &out);
+        printf("time stamp: %d\n", out.timestamp_ms);
+        printf("log channel %d", out.flags);
+        //printf(pauload);
+    }
+}
+
+static void cmd_log_format()
+{
+    log_format();
+}
+
 static const cmd_entry_t s_cmds[] = {
     { "HELP", cmd_help, "list commands" },
+    { "STATUS", cmd_help, "list commands" },
+    { "MODE", cmd_help, "list commands" },
+    { "SET", cmd_help, "list commands" },
+    { "FORMAT", cmd_log_format, "list commands" },
+    { "DOWNLOAD", download, "list commands" },
+    { "CPU", cmd_help, "list commands" },
     /* STUDENT TODO: STATUS, MODE, SET, FORMAT, DOWNLOAD, CPU ... (R25) */
 };
 
@@ -114,7 +149,7 @@ static const cmd_entry_t s_cmds[] = {
  * sample path. */
 static void HeartbeatTask(void *arg)
 {
-    (void)arg;
+    (void)arg; 
     uint32_t on = 0u;
     for (;;) {
         on ^= 1u;
@@ -129,7 +164,7 @@ static void HeartbeatTask(void *arg)
  * jitter-free — spec R3), taking i2c3Mutex around a sensor read (spec R7),
  * the provided command-table parser (spec R25), and the provided LIVE page
  * renderer (spec §3 — the LOG/TASKS pages come alive as YOUR logger does). */
-static void UITask(void *arg)
+/*static void UITask(void *arg)
 {
     (void)arg;
     uint32_t tick = osKernelGetTickCount();
@@ -138,13 +173,13 @@ static void UITask(void *arg)
         tick += 50u;
         osDelayUntil(tick);
 
-        cmd_table_poll();                    /* non-blocking console service   */
+        cmd_table_poll();                    
 
-        if (++sub >= 20u) {                  /* ~1 s                           */
+        if (++sub >= 20u) {                 
             sub = 0u;
             perf_mon_tick_1s();
 
-            float tc = 0.0f;                 /* live temp under the bus mutex  */
+            float tc = 0.0f;                
             osMutexAcquire(i2c3MutexHandle, osWaitForever);
             (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
             osMutexRelease(i2c3MutexHandle);
@@ -153,14 +188,12 @@ static void UITask(void *arg)
             ui_live_t live = {
                 .temp_dC     = (int16_t)td,
                 .temp_fault  = 0u,
-                .posture     = UI_POSTURE_UNKNOWN,   /* your IMU sampler fills */
-                .range_mm    = 0u,                   /* your ToF read fills    */
+                .posture     = UI_POSTURE_UNKNOWN,   
+                .range_mm    = 0u,                   
                 .range_fault = 0u,
                 .cpu_percent = (uint8_t)perf_cpu_percent(),
             };
-            ui_pages_render(&live);          /* LIVE page (B1 cycling: connect
-                                              * ui_pages_next() to the button
-                                              * in your full design)           */
+            ui_pages_render(&live);          
 
             printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu  temp=%d.%dC\n",
                    perf_cpu_percent(), (unsigned long)perf_idle_per_sec(),
@@ -168,7 +201,7 @@ static void UITask(void *arg)
                    td / 10, (td < 0 ? -td : td) % 10);
         }
     }
-}
+}*/
 
 /* ============================ app_start ================================== */
 
@@ -193,18 +226,21 @@ void app_start(void)
     cmd_table_init(s_cmds, sizeof(s_cmds) / sizeof(s_cmds[0]));
 
     /* --- smoke-test tasks (REPLACE with the logger — see block below) --- */
-    const osThreadAttr_t hb_attr = { .name = "hb", .stack_size = 512u,
-                                     .priority = osPriorityLow };
+    /*const osThreadAttr_t hb_attr = { .name = "hb", .stack_size = 512u,
+                                     .priority = osPriorityLow };*/
     const osThreadAttr_t ui_attr = { .name = "ui", .stack_size = 2048u,
                                      .priority = osPriorityLow };
     const osThreadAttr_t im_attr = { .name = "im", .stack_size = 2048u,
                                     .priority = osPriorityAboveNormal };
     const osThreadAttr_t vi_attr = { .name = "vi", .stack_size = 2048u,
-                                    .priority = osPriorityNormal };                                
-    osThreadNew(HeartbeatTask, NULL, &hb_attr);
+                                    .priority = osPriorityNormal };  
+    const osThreadAttr_t lo_attr = { .name = "lo", .stack_size = 2048u,
+                                    .priority = osPriorityNormal };                               
+    //osThreadNew(HeartbeatTask, NULL, &hb_attr);
     osThreadNew(UITask,        NULL, &ui_attr);
     osThreadNew(ImuSampleTask,        NULL, &im_attr);
     osThreadNew(VitalsSampleTask, NULL, &vi_attr);
+    osThreadNew(LoggerTask, NULL, &lo_attr);
 }
 
 /* ==================== ISR -> task handoff (spec R4/R10) =================== */
@@ -278,11 +314,19 @@ static void ImuSampleTask(void *arg)
         smooth_acc.y = 0;
         smooth_acc.z = 0;
         
+        uint8_t flags;
         static uint8_t smooth_count = 0;
         osSemaphoreAcquire(imuDrdySemHandle, 100);
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
+        int32_t status = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
         osMutexRelease(i2c3MutexHandle);
+        if (status == ISM330DHCX_ERROR)
+        {
+            flags = LOG_F_FAULT;
+        }
+        else {
+            flags = LOG_F_VALID;
+        }
 
         if (smooth_count < 4)
         {
@@ -308,6 +352,18 @@ static void ImuSampleTask(void *arg)
             roll_calib = lroundf(roll * 10); //- roll_offset;
             smooth_count = 0;
             acc_data_ready = true;
+            pos = posture_check(roll_calib);
+            uint32_t time = HAL_GetTick();
+            uint8_t payload[8] = {0};
+            int16_t ax = (int16_t) smooth_acc.x;
+            int16_t ay = (int16_t) smooth_acc.y;
+            int16_t az = (int16_t) smooth_acc.z;
+
+            memcpy(&payload[0], &ax, 2);
+            memcpy(&payload[2], &ay, 2);
+            memcpy(&payload[4], &az, 2);
+            payload[6] = pos;
+            create_record(time, LOG_CH_IMU,  flags,  payload);
         }
         if (acc_data_ready)
         {
@@ -319,31 +375,57 @@ static void ImuSampleTask(void *arg)
 
 static void VitalsSampleTask(void *arg)
 {
+    (void)arg;
     uint32_t tick = osKernelGetTickCount();
-    uint32_t sub  = 0u;
     for (;;) {
         tick += 1000u;
         osDelayUntil(tick);
-        sub = 0u;
 
         float tc = 0.0f;                 /* live temp under the bus mutex  */
         uint16_t mm = 0;
+        uint8_t flags;
         osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
-        (void)VL53L0X_ReadRangeSingle(&tof, &mm);
+        int32_t status = STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
         osMutexRelease(i2c3MutexHandle);
-        int td = (int)(tc * 10.0f);
-        int check = (int) mm;
-        printf("works %d.%d,   mm %d\n", (td / 10), (td % 10), check);
+        uint32_t time = HAL_GetTick();
+        if (status == STTS22H_ERROR)
+        {
+            flags = LOG_F_FAULT;
+        }
+        else {
+            flags = LOG_F_VALID;
+        }
+        //osMutexAcquire(i2c3MutexHandle, osWaitForever);
+        //osDelayUntil(tick + 100);
+        //(void)VL53L0X_ReadRangeSingle(&tof, &mm);
+        //osMutexRelease(i2c3MutexHandle);
+
+        td = (int16_t)(tc * 10.0f);
+        int16_t td_paylod = td * 10;
+        //int check = (int) mm;
+
+        uint8_t  payload[8] = {0}; 
+        memcpy(&payload[0], &td_paylod, sizeof(td_paylod));
+        create_record(time, LOG_CH_TEMP, flags, payload);
+        //printf("works %d.%d,   mm %d\n", (td / 10), (td % 10), check);
     }
 }
 
 static void LoggerTask(void *arg)
 {
-
+    (void)arg;
+    log_record_t temp;
+    for (;;)
+    {
+        if (osMessageQueueGet(vitalsQueueHandle, &temp, NULL, 1000) == osOK)
+        {
+            log_append(&temp);
+        }
+    }
+    
 }
 
-/*static void UITask(void *arg)
+static void UITask(void *arg)
 {
     (void)arg;
     uint32_t tick = osKernelGetTickCount();
@@ -358,26 +440,43 @@ static void LoggerTask(void *arg)
             sub = 0u;
             perf_mon_tick_1s();
 
-            float tc = 0.0f;                
-            osMutexAcquire(i2c3MutexHandle, osWaitForever);
-            (void)STTS22H_TEMP_GetTemperature(&temp_sensor, &tc);
-            osMutexRelease(i2c3MutexHandle);
-            int td = (int)(tc * 10.0f);
-
             ui_live_t live = {
-                .temp_dC     = (int16_t)td,
+                .temp_dC     = td,
                 .temp_fault  = 0u,
                 .posture     = UI_POSTURE_UNKNOWN,   
-                .range_mm    = 0u,                  
+                .range_mm    = 0u,                   
                 .range_fault = 0u,
                 .cpu_percent = (uint8_t)perf_cpu_percent(),
             };
             ui_pages_render(&live);          
-
-            printf("[ui] cpu=%u%%  idle/s=%lu  base=%lu  temp=%d.%dC\n",
-                   perf_cpu_percent(), (unsigned long)perf_idle_per_sec(),
-                   (unsigned long)perf_baseline(),
-                   td / 10, (td < 0 ? -td : td) % 10);
         }
     }
-}*/
+}
+
+static void create_record(uint32_t timestamp_ms, uint8_t  channel, uint8_t  flags, uint8_t  payload[8])
+{
+    total_records++;
+    log_record_t new_record = {0};
+    new_record.timestamp_ms = timestamp_ms;
+    new_record.channel = channel;
+    new_record.flags = flags;
+    memcpy(&new_record.payload, &payload, 8);
+    osMessageQueuePut(vitalsQueueHandle, &new_record, 0, 0);
+}
+
+static uint8_t posture_check(int32_t roll)
+{
+    if (labs(roll) <= 100)
+    {
+        return UI_POSTURE_SUPINE;
+    }
+    if (roll >= 200 && roll <= 400)
+    {
+        return UI_POSTURE_RIGHT;
+    }
+    if (roll <= -200 && roll >= -400)
+    {
+        return UI_POSTURE_LEFT;
+    }
+    return UI_POSTURE_PRONE;
+}
