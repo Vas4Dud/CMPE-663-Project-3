@@ -46,6 +46,7 @@ static void LoggerTask(void *arg);
 static void UITask(void *arg);
 static void create_record(uint32_t timestamp_ms, uint8_t  channel, uint8_t  flags, uint8_t  payload[8]);
 static uint8_t posture_check(int32_t roll);
+void get_stack(uint32_t space[], uint32_t *depth );
 
 /* ---- shared RTOS handles (declared extern in tasks.h / log_store.c) --------*/
 osMutexId_t        flashMutexHandle;
@@ -57,6 +58,13 @@ bool acc_data_ready = false;
 static int16_t td = 0;
 static uint8_t pos = UI_POSTURE_UNKNOWN;
 static uint16_t total_records = 0;
+static uint16_t b1_presses = 0;
+
+static osThreadId_t ui_thread;
+static osThreadId_t log_thread;
+static osThreadId_t vitals_thread;
+static osThreadId_t imu_thread;
+
 /* ============================ POST (pre-scheduler) ======================== */
 
 void app_post(void)
@@ -109,8 +117,9 @@ static void cmd_help(int argc, char *argv[])
     cmd_table_help();
 }
 
-static void download()
+static void download(int argc, char *argv[])
 {
+    (void)argc; (void)argv;
     log_status_t status;
     log_store_status(&status);
     log_record_t out;
@@ -123,14 +132,31 @@ static void download()
     }
 }
 
-static void cmd_log_format()
+static void cmd_log_format(int argc, char *argv[])
 {
-    log_format();
+    (void)argc; (void)argv;
+    log_status_t status;
+    log_store_status(&status);
+    printf("STATUS: record count %d,  overflow count %d", 
+        status.record_count, status.overflow_count);
+}
+
+static void cmd_status(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    uint32_t rc = log_format();
+    if (rc == 0)
+    {
+        printf("LOG_OK\n");
+    }
+    else {
+        printf("ERROR\n");
+    }
 }
 
 static const cmd_entry_t s_cmds[] = {
     { "HELP", cmd_help, "list commands" },
-    { "STATUS", cmd_help, "list commands" },
+    { "STATUS", cmd_status, "list commands" },
     { "MODE", cmd_help, "list commands" },
     { "SET", cmd_help, "list commands" },
     { "FORMAT", cmd_log_format, "list commands" },
@@ -237,10 +263,10 @@ void app_start(void)
     const osThreadAttr_t lo_attr = { .name = "lo", .stack_size = 2048u,
                                     .priority = osPriorityNormal };                               
     //osThreadNew(HeartbeatTask, NULL, &hb_attr);
-    osThreadNew(UITask,        NULL, &ui_attr);
-    osThreadNew(ImuSampleTask,        NULL, &im_attr);
-    osThreadNew(VitalsSampleTask, NULL, &vi_attr);
-    osThreadNew(LoggerTask, NULL, &lo_attr);
+    ui_thread = osThreadNew(UITask,        NULL, &ui_attr);
+    imu_thread =  osThreadNew(ImuSampleTask,        NULL, &im_attr);
+    vitals_thread = osThreadNew(VitalsSampleTask, NULL, &vi_attr);
+    log_thread = osThreadNew(LoggerTask, NULL, &lo_attr);
 }
 
 /* ==================== ISR -> task handoff (spec R4/R10) =================== */
@@ -254,6 +280,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == GPIO_PIN_2) {          /* PD2 = ISM330DHCX INT1 (DRDY)     */
         osSemaphoreRelease(imuDrdySemHandle);
     }
+    if (GPIO_Pin == User_B1_Pin)  { b1_presses = 1; }
+    //if (GPIO_Pin == User_B2_Pin)  { b2_presses = 1; }
     /* PC12/PC13 (buttons) also come here in the full design. Dispatch by pin. */
 }
 
@@ -316,59 +344,62 @@ static void ImuSampleTask(void *arg)
         
         uint8_t flags;
         static uint8_t smooth_count = 0;
-        osSemaphoreAcquire(imuDrdySemHandle, 100);
-        osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        int32_t status = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
-        osMutexRelease(i2c3MutexHandle);
-        if (status == ISM330DHCX_ERROR)
+        if (osSemaphoreAcquire(imuDrdySemHandle, osWaitForever) == osOK)
         {
-            flags = LOG_F_FAULT;
-        }
-        else {
-            flags = LOG_F_VALID;
-        }
-
-        if (smooth_count < 4)
-        {
-            four_acc[smooth_count] = current_acc;
-            smooth_count++;
-            acc_data_ready = false;
-        }
-        else 
-        {
-            for (int i = 0; i < 4; i++)
+            osMutexAcquire(i2c3MutexHandle, osWaitForever);
+            int32_t status = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
+            osMutexRelease(i2c3MutexHandle);
+            if (status == ISM330DHCX_ERROR)
             {
-                smooth_acc.x += four_acc[i].x;
-                smooth_acc.y += four_acc[i].y;
-                smooth_acc.z += four_acc[i].z;
+                flags = LOG_F_FAULT;
             }
-            smooth_acc.x /= 4;
-            smooth_acc.y /= 4;
-            smooth_acc.z /= 4;
-            float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
-            pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
-            roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
-            angle = lroundf(pitch * 10); //- angle_offset;  //FIX THIS
-            roll_calib = lroundf(roll * 10); //- roll_offset;
-            smooth_count = 0;
-            acc_data_ready = true;
-            pos = posture_check(roll_calib);
-            uint32_t time = HAL_GetTick();
-            uint8_t payload[8] = {0};
-            int16_t ax = (int16_t) smooth_acc.x;
-            int16_t ay = (int16_t) smooth_acc.y;
-            int16_t az = (int16_t) smooth_acc.z;
+            else {
+                flags = LOG_F_VALID;
+            }
 
-            memcpy(&payload[0], &ax, 2);
-            memcpy(&payload[2], &ay, 2);
-            memcpy(&payload[4], &az, 2);
-            payload[6] = pos;
-            create_record(time, LOG_CH_IMU,  flags,  payload);
+            if (smooth_count < 4)
+            {
+                four_acc[smooth_count] = current_acc;
+                smooth_count++;
+                acc_data_ready = false;
+            }
+            else 
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    smooth_acc.x += four_acc[i].x;
+                    smooth_acc.y += four_acc[i].y;
+                    smooth_acc.z += four_acc[i].z;
+                }
+                smooth_acc.x /= 4;
+                smooth_acc.y /= 4;
+                smooth_acc.z /= 4;
+                float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
+                pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
+                roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
+                angle = lroundf(pitch * 10); //- angle_offset;  //FIX THIS
+                roll_calib = lroundf(roll * 10); //- roll_offset;
+                smooth_count = 0;
+                acc_data_ready = true;
+                pos = posture_check(roll_calib);
+                uint32_t time = HAL_GetTick();
+                uint8_t payload[8] = {0};
+                int16_t ax = (int16_t) smooth_acc.x;
+                int16_t ay = (int16_t) smooth_acc.y;
+                int16_t az = (int16_t) smooth_acc.z;
+
+                memcpy(&payload[0], &ax, 2);
+                memcpy(&payload[2], &ay, 2);
+                memcpy(&payload[4], &az, 2);
+                payload[6] = pos;
+                create_record(time, LOG_CH_IMU,  flags,  payload);
+            }
+            if (acc_data_ready)
+            {
+                //printf("works %d.%d", (angle / 10), (angle % 10));
+            }
         }
-        if (acc_data_ready)
-        {
-            //printf("works %d.%d", (angle / 10), (angle % 10));
-        }
+        
     }
     
 }
@@ -395,9 +426,10 @@ static void VitalsSampleTask(void *arg)
         else {
             flags = LOG_F_VALID;
         }
+        //tick += 100;
         //osMutexAcquire(i2c3MutexHandle, osWaitForever);
-        //osDelayUntil(tick + 100);
-        //(void)VL53L0X_ReadRangeSingle(&tof, &mm);
+       //osDelayUntil(tick);
+        //VL53L0X_ReadRangeSingle(&tof, &mm);
         //osMutexRelease(i2c3MutexHandle);
 
         td = (int16_t)(tc * 10.0f);
@@ -443,11 +475,16 @@ static void UITask(void *arg)
             ui_live_t live = {
                 .temp_dC     = td,
                 .temp_fault  = 0u,
-                .posture     = UI_POSTURE_UNKNOWN,   
+                .posture     = pos,   
                 .range_mm    = 0u,                   
                 .range_fault = 0u,
                 .cpu_percent = (uint8_t)perf_cpu_percent(),
             };
+            if (b1_presses == 1)
+            {
+                ui_pages_next();
+                b1_presses = 0;
+            }
             ui_pages_render(&live);          
         }
     }
@@ -460,7 +497,7 @@ static void create_record(uint32_t timestamp_ms, uint8_t  channel, uint8_t  flag
     new_record.timestamp_ms = timestamp_ms;
     new_record.channel = channel;
     new_record.flags = flags;
-    memcpy(&new_record.payload, &payload, 8);
+    memcpy(new_record.payload, payload, 8);
     osMessageQueuePut(vitalsQueueHandle, &new_record, 0, 0);
 }
 
@@ -479,4 +516,14 @@ static uint8_t posture_check(int32_t roll)
         return UI_POSTURE_LEFT;
     }
     return UI_POSTURE_PRONE;
+}
+
+void get_stack(uint32_t space[], uint32_t *depth )
+{
+    space[0] = osThreadGetStackSpace(ui_thread);
+    space[1] = osThreadGetStackSpace(log_thread);
+    space[2] = osThreadGetStackSpace(vitals_thread);
+    space[3] = osThreadGetStackSpace(imu_thread);
+
+    *depth = osMessageQueueGetCount(vitalsQueueHandle);
 }
