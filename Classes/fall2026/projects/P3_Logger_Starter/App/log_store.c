@@ -248,8 +248,10 @@ int32_t log_read_record(uint32_t index, log_record_t *out)
      if (index < s_count)
      {
         flash_lock();
-        S25FL128S_Read(DATA_BASE + index*16, (uint8_t *) out, 16);
+        int32_t status = S25FL128S_Read(DATA_BASE + index*16, (uint8_t *) out, 16);
+        
         flash_unlock();
+        if (status != S25FL128S_OK) {return LOG_ERR;}
         if (out->crc16 != log_crc16((const uint8_t *) out, 14))
         {
             out->flags |= LOG_F_FAULT;
