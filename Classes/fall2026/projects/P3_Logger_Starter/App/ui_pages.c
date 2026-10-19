@@ -16,6 +16,8 @@
 #include "ui_pages.h"
 #include "oled.h"
 #include "log_store.h"
+#include "tasks.h"
+#include "cmsis_os2.h"   
 
 static ui_page_t s_page = UI_PAGE_LIVE;
 
@@ -92,10 +94,16 @@ static void render_log(void)
  * shows nothing that a grader can grade. */
 static void render_tasks(void)
 {
-    oled_printf(0, "AL-24  TASKS");
-    oled_printf(3, "STUDENT TODO");
-    oled_printf(5, "stack hi-water/task");
-    oled_printf(6, "queue depth/hi-water");
+    uint32_t stack = 0;
+    uint32_t space[4];
+
+    get_stack(space, &stack);
+    oled_printf(0, "stack %d", stack);
+    oled_printf(1, "ui %d", space[0]);
+    oled_printf(1, "vitals %d", space[2]);
+    oled_printf(2, "imu %d", space[3]);
+    oled_printf(3, "log %d", space[1]);
+
 }
 
 void ui_pages_render(const ui_live_t *live)
